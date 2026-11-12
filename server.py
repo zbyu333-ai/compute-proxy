@@ -29,6 +29,13 @@ Space 里只放 DATA_URL，不放任何密钥。
   被临时封禁 12 小时，2026-11-13 04:00 CST 后才能重试。未接。
 - Cloudflare Workers AI：2026-11-12 云浏览器登录页 Turnstile 验证反复失败，
   未能登录、未拿到 token。未接。
+- NEX（复旦 MOSS，platform.moss.cn）：OpenAI 兼容形态，POST
+  https://api.mosi.cn/v1/chat/completions（注意域名是 api.mosi.cn）。
+  模型 nex-n2.6，基于 GLM-5.3-Flash 后训练，全模态。限时免费、调用 0 积分，
+  但无定量额度、无免费截止日、无 RPM/TPM 与速度承诺（评论实测约 9 token/s），
+  协议保留随时调价/改额度/下线模型的权利；商用须另行签协议。真下发可用，
+  定位为低成本试点/降级通道，不当主力。注册免实名、免绑卡（邮箱或手机号
+  验证码即可）。
 
 环境变量：
   OPENROUTER_API_KEY  OpenRouter 的 API key（sk-or-...）
@@ -36,13 +43,14 @@ Space 里只放 DATA_URL，不放任何密钥。
   GROQ_API_KEY        Groq 的 API key（console.groq.com 生成，gsk-...）
   GEMINI_API_KEY      Gemini 的 API key（aistudio.google.com 生成）
   SAMBANOVA_API_KEY   SambaNova 的 API key（cloud.sambanova.ai/apis 生成）
+  MOSS_API_KEY        MOSS/NEX 的 API key（platform.moss.cn 控制台生成）
   PORT                监听端口，默认 8080
 
 接口：
   GET /api/resources.json  -> {"updated_at": ..., "resources": [...8 条...]}
   GET /health             -> {"ok": true}
   POST /api/execute       -> {"provider","prompt","model"?} -> {"ok","result"}
-    真下发：调模型接口跑任务。provider 限 openrouter/groq/gemini/sambanova；
+    真下发：调模型接口跑任务。provider 限 openrouter/groq/gemini/sambanova/nex；
     prompt 限 4000 字；每分钟最多 10 次（防刷额度）。
 
 只用标准库，不用 pip 装任何东西。python3 server.py 即可跑。
@@ -66,6 +74,7 @@ KAGGLE_TOKEN = os.environ.get("KAGGLE_API_TOKEN", "")
 GROQ_KEY = os.environ.get("GROQ_API_KEY", "")
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 SAMBANOVA_KEY = os.environ.get("SAMBANOVA_API_KEY", "")
+MOSS_KEY = os.environ.get("MOSS_API_KEY", "")
 PORT = int(os.environ.get("PORT", "8080"))
 
 _cache = {"at": 0, "data": None}
@@ -385,7 +394,17 @@ def execute_task(provider, prompt, model=None):
         except Exception as e:  # noqa: BLE001
             return None, f"SambaNova 调用失败: {e}"
         return {"provider": "sambanova", "model": use_model, "result": text}, None
-    return None, f"不支持的 provider：{provider}（只支持 openrouter/groq/gemini/sambanova）"
+    if provider == "nex":
+        if not MOSS_KEY:
+            return None, "未配置 MOSS_API_KEY"
+        use_model = model or "nex-n2.6"
+        try:
+            text = _chat_completions(
+                "https://api.mosi.cn/v1", MOSS_KEY, use_model, prompt)
+        except Exception as e:  # noqa: BLE001
+            return None, f"NEX 调用失败: {e}"
+        return {"provider": "nex", "model": use_model, "result": text}, None
+    return None, f"不支持的 provider：{provider}（只支持 openrouter/groq/gemini/sambanova/nex）"
 
 
 # ---------------- 合并 ----------------
@@ -490,4 +509,5 @@ if __name__ == "__main__":
     print("Groq key:", "已配置" if GROQ_KEY else "未配置")
     print("Gemini key:", "已配置" if GEMINI_KEY else "未配置")
     print("SambaNova key:", "已配置" if SAMBANOVA_KEY else "未配置")
+    print("MOSS/NEX key:", "已配置" if MOSS_KEY else "未配置")
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()

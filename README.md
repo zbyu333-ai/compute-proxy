@@ -6,14 +6,14 @@ Space 里只放 `DATA_URL`，不放任何密钥。
 ## 文件
 
 - `server.py` — 服务本身，只用 Python 标准库，不用 pip 装任何东西
-- `manual.json` — 手工值：Colab / Cloady / Sakupa / Simular 四格，以及 OpenRouter、Kaggle、Groq 在没配密钥时的回落值；Gemini 目前只做手工登记
+- `manual.json` — 手工值：Colab / Cloady / Sakupa / Simular 四格，以及 OpenRouter、Kaggle、Groq 在没配密钥时的回落值；Gemini、NEX 目前只做手工登记
 - `Dockerfile` — 放容器里跑用的镜像
 
 ## 本地跑
 
 ```bash
 cd proxy
-OPENROUTER_API_KEY=sk-or-... KAGGLE_API_TOKEN=... GROQ_API_KEY=gsk-... GEMINI_API_KEY=... SAMBANOVA_API_KEY=... python3 server.py
+OPENROUTER_API_KEY=sk-or-... KAGGLE_API_TOKEN=... GROQ_API_KEY=gsk-... GEMINI_API_KEY=... SAMBANOVA_API_KEY=... MOSS_API_KEY=... python3 server.py
 # 打开 http://localhost:8080/api/resources.json 看一眼
 # 健康检查：http://localhost:8080/health
 ```
@@ -28,6 +28,7 @@ OPENROUTER_API_KEY=sk-or-... KAGGLE_API_TOKEN=... GROQ_API_KEY=gsk-... GEMINI_AP
 - **Groq**：登录 console.groq.com → API Keys → 新建一个 key（`gsk-...` 开头）。代理调 `GET /openai/v1/models` 读响应头 `x-ratelimit-remaining-requests`（当日剩余请求数），不耗 completion 额度。
 - **Gemini**：API key 查不到剩余额度（剩余额度只在 AI Studio / Service Usage API 里，需 GCP 服务账号 OAuth，不只是 API key），所以 Gemini 目前只做手工登记，不接实时；免费额度在 `manual.json` 里按 Flash-Lite 每日 500 次登记，剩余额度请按实际用量手动修改。
 - **SambaNova**：登录 cloud.sambanova.ai → APIs（API Keys）→ 新建一把 key（默认名 Default Key，有效期 90 天，到期需轮换重新生成）。接口是 OpenAI 兼容的 `https://api.sambanova.ai/v1/chat/completions`，默认模型 `Meta-Llama-3.3-70B-Instruct`（2026-11-12 实测在 `/v1/models` 在列；max_completion_tokens 3072，本代理 max_tokens 2048 在限内）。无公开剩余额度接口，额度只做手工登记；真下发可用。注意：key 生成时只完整显示一次（页面此后只显示掩码），须立即粘贴保存到安全处，丢失只能在页面 Rotate 重新生成。
+- **NEX（复旦 MOSS）**：登录 platform.moss.cn → 控制台 API Keys → 新建一把 key。接口形态类 OpenAI：`POST https://api.mosi.cn/v1/chat/completions`（注意域名是 api.mosi.cn），默认模型 `nex-n2.6`（基于 GLM-5.3-Flash 后训练，全模态）。限时免费、调用 0 积分，但无定量额度、无免费截止日、无 RPM/TPM 与速度承诺（评论实测约 9 token/s）；协议保留随时调价/改额度/下线模型的权利，商用须另行签协议。额度只做手工登记；真下发可用，定位为低成本试点/降级通道，不当主力。注册免实名、免绑卡（邮箱或手机号验证码即可）。
 
 密钥只放进部署环境的变量里，不写进 Space、不写进聊天记录、不提交到任何公开位置。
 
@@ -41,6 +42,7 @@ docker run -d --name compute-proxy -p 8080:8080 \
   -e GROQ_API_KEY=gsk-... \
   -e GEMINI_API_KEY=... \
   -e SAMBANOVA_API_KEY=... \
+  -e MOSS_API_KEY=... \
   compute-proxy
 ```
 
@@ -58,9 +60,9 @@ curl -X POST https://你的代理地址/api/execute \
 # -> {"ok":true,"provider":"groq","model":"openai/gpt-oss-120b","result":"..."}
 ```
 
-- `provider` 只支持 `openrouter` / `groq` / `gemini` / `sambanova`；`prompt` 限 4000 字；`model` 可省略（默认 OpenRouter 用 google/gemma-4-31b-it:free、Groq 用 gpt-oss-120b、Gemini 用 gemini-2.5-flash、SambaNova 用 Meta-Llama-3.3-70B-Instruct）。
+- `provider` 只支持 `openrouter` / `groq` / `gemini` / `sambanova` / `nex`；`prompt` 限 4000 字；`model` 可省略（默认 OpenRouter 用 google/gemma-4-31b-it:free、Groq 用 gpt-oss-120b、Gemini 用 gemini-2.5-flash、SambaNova 用 Meta-Llama-3.3-70B-Instruct、NEX 用 nex-n2.6）。
 - 每分钟最多 10 次真下发（防刷额度），超了返回 429。
-- 需要的 key：OpenRouter、Groq、Gemini、SambaNova 的 key 都要配进部署环境变量（`OPENROUTER_API_KEY` / `GROQ_API_KEY` / `GEMINI_API_KEY` / `SAMBANOVA_API_KEY`）。没配 key 的那家会返回 502 报错，不会把代理搞挂。
+- 需要的 key：OpenRouter、Groq、Gemini、SambaNova、NEX 的 key 都要配进部署环境变量（`OPENROUTER_API_KEY` / `GROQ_API_KEY` / `GEMINI_API_KEY` / `SAMBANOVA_API_KEY` / `MOSS_API_KEY`）。没配 key 的那家会返回 502 报错，不会把代理搞挂。
 - 注意：这个接口会消耗各家的免费额度，代理地址不要公开扩散。
 - 未接真下发的工位：Mistral（免费档不给 key，用户不付费）、NVIDIA NIM（账号被临时封禁 12 小时，2026-11-13 04:00 CST 后重试手机验证拿 key）、Cloudflare Workers AI（云浏览器登录页 Turnstile 验证失败，未拿到 token）。
 
