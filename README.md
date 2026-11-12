@@ -58,7 +58,7 @@ curl -X POST https://你的代理地址/api/execute \
 # -> {"ok":true,"provider":"groq","model":"openai/gpt-oss-120b","result":"..."}
 ```
 
-- `provider` 只支持 `openrouter` / `groq` / `gemini` / `sambanova`；`prompt` 限 4000 字；`model` 可省略（默认 OpenRouter 用 DeepSeek 免费模型、Groq 用 gpt-oss-120b、Gemini 用 gemini-2.5-flash、SambaNova 用 Meta-Llama-3.3-70B-Instruct）。
+- `provider` 只支持 `openrouter` / `groq` / `gemini` / `sambanova`；`prompt` 限 4000 字；`model` 可省略（默认 OpenRouter 用 google/gemma-4-31b-it:free、Groq 用 gpt-oss-120b、Gemini 用 gemini-2.5-flash、SambaNova 用 Meta-Llama-3.3-70B-Instruct）。
 - 每分钟最多 10 次真下发（防刷额度），超了返回 429。
 - 需要的 key：OpenRouter、Groq、Gemini、SambaNova 的 key 都要配进部署环境变量（`OPENROUTER_API_KEY` / `GROQ_API_KEY` / `GEMINI_API_KEY` / `SAMBANOVA_API_KEY`）。没配 key 的那家会返回 502 报错，不会把代理搞挂。
 - 注意：这个接口会消耗各家的免费额度，代理地址不要公开扩散。
