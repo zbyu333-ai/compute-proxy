@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""AI 算力指挥中心 — 代理层（第一阶段）
+"""AI 算力指挥中心 — 代理层（第一阶段额度 + 第二阶段真下发）
 
-作用：拿着密钥定时调各家接口，吐一个 JSON 给静态 Space 读。
+作用：拿着密钥调各家接口，吐一个 JSON 给 Space 读；并接受 Space 的
+派活请求，真的去调模型接口把任务跑了，把结果返回。
 Space 里只放 DATA_URL，不放任何密钥。
 
 - OpenRouter：已验证。GET https://openrouter.ai/api/v1/key 返回
@@ -10,16 +11,39 @@ Space 里只放 DATA_URL，不放任何密钥。
 - Kaggle：走官方 MCP https://www.kaggle.com/mcp，工具 get_accelerator_quota。
   MCP 传输细节尚未用真实 token 实测，失败时自动回落到 manual.json 的手动值，
   并在 note 里写明，不会让整条接口挂掉。
+- Groq：无专用剩余额度接口。调 GET https://api.groq.com/openai/v1/models
+  （轻量列表接口，不耗 completion 额度），读响应头 x-ratelimit-*：
+  x-ratelimit-remaining-requests 即当日剩余请求数（RPD），
+  x-ratelimit-limit-requests 即当日上限。读不到头时回落到 manual.json。
+- SambaNova：OpenAI 兼容接口，POST https://api.sambanova.ai/v1/chat/completions。
+  免费档模型用 Meta-Llama-3.3-70B-Instruct（2026-11-12 实测 /v1/models 在列，
+  max_completion_tokens 3072，本代理 max_tokens 2048 在限内）。无公开剩余额度
+  接口，额度只做手工登记。真下发可用。
+- Gemini：API key 查不到剩余额度。剩余额度只在 AI Studio / Service Usage
+  API（需 GCP 服务账号 OAuth，不只是 API key）里有，所以 Gemini 额度目前只做
+  手工登记，不接实时。但真下发可以：调 generateContent 接口只要 API key 就行。
 - Colab / Cloady / Sakupa / Simular：无公开剩余额度接口，读 manual.json 的手工值。
+- Mistral：免费档不给 API key（须付费升级），2026-11-12 用户决定不付费、跳过，
+  故不接真下发。
+- NVIDIA NIM：账号已注册，但生成 API key 前须手机验证；2026-11-12 验证时账号
+  被临时封禁 12 小时，2026-11-13 04:00 CST 后才能重试。未接。
+- Cloudflare Workers AI：2026-11-12 云浏览器登录页 Turnstile 验证反复失败，
+  未能登录、未拿到 token。未接。
 
 环境变量：
   OPENROUTER_API_KEY  OpenRouter 的 API key（sk-or-...）
   KAGGLE_API_TOKEN    Kaggle 的 API token（kaggle.com/settings/api 生成）
+  GROQ_API_KEY        Groq 的 API key（console.groq.com 生成，gsk-...）
+  GEMINI_API_KEY      Gemini 的 API key（aistudio.google.com 生成）
+  SAMBANOVA_API_KEY   SambaNova 的 API key（cloud.sambanova.ai/apis 生成）
   PORT                监听端口，默认 8080
 
 接口：
-  GET /api/resources.json  -> {"updated_at": ..., "resources": [...6 条...]}
+  GET /api/resources.json  -> {"updated_at": ..., "resources": [...8 条...]}
   GET /health             -> {"ok": true}
+  POST /api/execute       -> {"provider","prompt","model"?} -> {"ok","result"}
+    真下发：调模型接口跑任务。provider 限 openrouter/groq/gemini/sambanova；
+    prompt 限 4000 字；每分钟最多 10 次（防刷额度）。
 
 只用标准库，不用 pip 装任何东西。python3 server.py 即可跑。
 """
@@ -39,6 +63,9 @@ CACHE_TTL = 300  # 5 分钟
 
 OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 KAGGLE_TOKEN = os.environ.get("KAGGLE_API_TOKEN", "")
+GROQ_KEY = os.environ.get("GROQ_API_KEY", "")
+GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
+SAMBANOVA_KEY = os.environ.get("SAMBANOVA_API_KEY", "")
 PORT = int(os.environ.get("PORT", "8080"))
 
 _cache = {"at": 0, "data": None}
@@ -78,6 +105,44 @@ def fetch_openrouter():
         "quotaTotal": limit,
         "usedPct": round(used / limit * 100) if limit else 0,
         "note": "实时 · 每日 UTC 午夜重置",
+        "source": "live",
+    }, None
+
+
+# ---------------- Groq ----------------
+
+def fetch_groq():
+    """返回 (patch_dict, error_str)。调 /openai/v1/models 读 x-ratelimit 响应头。
+
+    x-ratelimit-remaining-requests = 当日剩余请求数（RPD），
+    x-ratelimit-limit-requests = 当日上限。/models 是轻量列表接口，
+    不耗 completion 额度。读不到头时回落，不让接口挂掉。
+    """
+    if not GROQ_KEY:
+        return None, "未配置 GROQ_API_KEY"
+    req = urllib.request.Request(
+        "https://api.groq.com/openai/v1/models",
+        headers={"Authorization": f"Bearer {GROQ_KEY}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            headers = resp.headers
+    except Exception as e:  # noqa: BLE001 - 任何失败都回落，不让接口挂掉
+        return None, f"请求失败: {e}"
+    try:
+        limit = int(float(headers.get("x-ratelimit-limit-requests")))
+        remaining = int(float(headers.get("x-ratelimit-remaining-requests")))
+    except (TypeError, ValueError):
+        return None, "响应头里没有 x-ratelimit-remaining-requests"
+    if limit is None or remaining is None:
+        return None, "响应头里没有 x-ratelimit-remaining-requests"
+    used = max(limit - remaining, 0)
+    return {
+        "quotaLabel": "今日请求",
+        "quotaRemain": remaining,
+        "quotaTotal": limit,
+        "usedPct": round(used / limit * 100) if limit else 0,
+        "note": "实时 · 响应头 x-ratelimit（RPD）",
         "source": "live",
     }, None
 
@@ -211,6 +276,118 @@ def fetch_kaggle():
         return None, f"MCP 调用失败: {e}"
 
 
+# ---------------- 真下发（第二阶段） ----------------
+
+EXEC_MAX_PROMPT = 4000
+EXEC_PER_MIN = 10
+EXEC_TIMEOUT = 60
+
+_exec_times = []
+_exec_lock = threading.Lock()
+
+
+def _exec_allowed():
+    """每分钟最多 EXEC_PER_MIN 次真下发，防刷额度。返回 True 表示放行。"""
+    now = time.time()
+    with _exec_lock:
+        _exec_times[:] = [t for t in _exec_times if now - t < 60]
+        if len(_exec_times) >= EXEC_PER_MIN:
+            return False
+        _exec_times.append(now)
+        return True
+
+
+def _post_json(url, headers, payload, timeout=EXEC_TIMEOUT):
+    req = urllib.request.Request(
+        url, data=json.dumps(payload).encode(),
+        headers=headers, method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.load(resp)
+
+
+def _chat_completions(base_url, key, model, prompt):
+    """OpenAI 兼容的 chat/completions：OpenRouter、Groq 共用。返回结果文本。"""
+    payload = _post_json(
+        base_url + "/chat/completions",
+        {"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        {"model": model,
+         "messages": [{"role": "user", "content": prompt}],
+         "max_tokens": 2048},
+    )
+    choices = payload.get("choices") or []
+    if not choices:
+        raise ValueError(f"接口未返回 choices：{str(payload)[:200]}")
+    return (choices[0].get("message") or {}).get("content") or ""
+
+
+def _gemini_generate(model, prompt):
+    """Gemini generateContent：只要 API key。返回结果文本。"""
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{model}:generateContent?key={GEMINI_KEY}"
+    )
+    payload = _post_json(
+        url, {"Content-Type": "application/json"},
+        {"contents": [{"parts": [{"text": prompt}]}]},
+    )
+    cands = payload.get("candidates") or []
+    if not cands:
+        raise ValueError(f"接口未返回 candidates：{str(payload)[:200]}")
+    parts = ((cands[0].get("content") or {}).get("parts") or [])
+    return "".join(p.get("text", "") for p in parts if isinstance(p, dict))
+
+
+def execute_task(provider, prompt, model=None):
+    """真的调模型接口跑一个任务。返回 (result_dict, error_str)。"""
+    provider = (provider or "").strip().lower()
+    prompt = (prompt or "").strip()
+    if not prompt:
+        return None, "prompt 为空"
+    if len(prompt) > EXEC_MAX_PROMPT:
+        return None, f"prompt 超过 {EXEC_MAX_PROMPT} 字"
+    if provider == "openrouter":
+        if not OPENROUTER_KEY:
+            return None, "未配置 OPENROUTER_API_KEY"
+        use_model = model or "deepseek/deepseek-chat-v3-0324:free"
+        try:
+            text = _chat_completions(
+                "https://openrouter.ai/api/v1", OPENROUTER_KEY, use_model, prompt)
+        except Exception as e:  # noqa: BLE001
+            return None, f"OpenRouter 调用失败: {e}"
+        return {"provider": "openrouter", "model": use_model, "result": text}, None
+    if provider == "groq":
+        if not GROQ_KEY:
+            return None, "未配置 GROQ_API_KEY"
+        use_model = model or "openai/gpt-oss-120b"
+        try:
+            text = _chat_completions(
+                "https://api.groq.com/openai/v1", GROQ_KEY, use_model, prompt)
+        except Exception as e:  # noqa: BLE001
+            return None, f"Groq 调用失败: {e}"
+        return {"provider": "groq", "model": use_model, "result": text}, None
+    if provider == "gemini":
+        if not GEMINI_KEY:
+            return None, "未配置 GEMINI_API_KEY"
+        use_model = model or "gemini-2.5-flash"
+        try:
+            text = _gemini_generate(use_model, prompt)
+        except Exception as e:  # noqa: BLE001
+            return None, f"Gemini 调用失败: {e}"
+        return {"provider": "gemini", "model": use_model, "result": text}, None
+    if provider == "sambanova":
+        if not SAMBANOVA_KEY:
+            return None, "未配置 SAMBANOVA_API_KEY"
+        use_model = model or "Meta-Llama-3.3-70B-Instruct"
+        try:
+            text = _chat_completions(
+                "https://api.sambanova.ai/v1", SAMBANOVA_KEY, use_model, prompt)
+        except Exception as e:  # noqa: BLE001
+            return None, f"SambaNova 调用失败: {e}"
+        return {"provider": "sambanova", "model": use_model, "result": text}, None
+    return None, f"不支持的 provider：{provider}（只支持 openrouter/groq/gemini/sambanova）"
+
+
 # ---------------- 合并 ----------------
 
 def build_resources():
@@ -231,6 +408,12 @@ def build_resources():
             resources["kaggle"].update(patch)
         elif "kaggle" in resources:
             resources["kaggle"]["note"] = f"待接线：{err}"
+
+        patch, err = fetch_groq()
+        if patch:
+            resources["groq"].update(patch)
+        elif "groq" in resources:
+            resources["groq"]["note"] = f"待接线：{err}"
 
         out = {
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -272,9 +455,39 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send_json({"ok": True, "usage": "GET /api/resources.json"})
 
+    def do_POST(self):  # noqa: N802
+        if self.path != "/api/execute":
+            self._send_json({"ok": False, "error": "unknown path"}, status=404)
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length <= 0 or length > 65536:
+            self._send_json({"ok": False, "error": "请求体为空或过大"}, status=400)
+            return
+        try:
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+        except Exception:  # noqa: BLE001
+            self._send_json({"ok": False, "error": "请求体不是合法 JSON"}, status=400)
+            return
+        if not _exec_allowed():
+            self._send_json(
+                {"ok": False, "error": "真下发每分钟最多 10 次，稍后再试"}, status=429)
+            return
+        result, err = execute_task(
+            body.get("provider"), body.get("prompt"), body.get("model"))
+        if err:
+            self._send_json({"ok": False, "error": err}, status=502)
+            return
+        self._send_json({"ok": True, **result})
+
 
 if __name__ == "__main__":
     print(f"compute-proxy listening on :{PORT}  (manual.json: {MANUAL_PATH})")
     print("OpenRouter key:", "已配置" if OPENROUTER_KEY else "未配置")
     print("Kaggle token:", "已配置" if KAGGLE_TOKEN else "未配置")
+    print("Groq key:", "已配置" if GROQ_KEY else "未配置")
+    print("Gemini key:", "已配置" if GEMINI_KEY else "未配置")
+    print("SambaNova key:", "已配置" if SAMBANOVA_KEY else "未配置")
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
