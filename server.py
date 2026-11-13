@@ -27,8 +27,11 @@ Space 里只放 DATA_URL，不放任何密钥。
   故不接真下发。
 - NVIDIA NIM：账号已注册，但生成 API key 前须手机验证；2026-11-12 验证时账号
   被临时封禁 12 小时，2026-11-13 04:00 CST 后才能重试。未接。
-- Cloudflare Workers AI：2026-11-12 云浏览器登录页 Turnstile 验证反复失败，
-  未能登录、未拿到 token。未接。
+- Cloudflare Workers AI：2026-11-13 用户已在自己浏览器登进 dash.cloudflare.com，
+  正在建 token（自定义权限，“人工智能与机器学习”分组 17 项全选）。已接真下发：
+  OpenAI 兼容端点 POST /client/v4/accounts/{ACCOUNT_ID}/ai/v1/chat/completions，
+  模型 @cf/meta/llama-3.1-8b-instruct。注意光有 token 不够，还要 Account ID
+  （控制台右侧栏复制），否则调不通。
 - NEX（复旦 MOSS，platform.moss.cn）：OpenAI 兼容形态，POST
   https://api.mosi.cn/v1/chat/completions（注意域名是 api.mosi.cn）。
   模型 nex-n2.6，基于 GLM-5.3-Flash 后训练，全模态。限时免费、调用 0 积分，
@@ -44,13 +47,16 @@ Space 里只放 DATA_URL，不放任何密钥。
   GEMINI_API_KEY      Gemini 的 API key（aistudio.google.com 生成）
   SAMBANOVA_API_KEY   SambaNova 的 API key（cloud.sambanova.ai/apis 生成）
   MOSS_API_KEY        MOSS/NEX 的 API key（platform.moss.cn 控制台生成）
+  CLOUDFLARE_API_TOKEN  Cloudflare API token（Workers AI 权限，dash.cloudflare.com 建）
+  CLOUDFLARE_ACCOUNT_ID Cloudflare Account ID（控制台右侧栏复制，token 之外必填）
   PORT                监听端口，默认 8080
 
 接口：
   GET /api/resources.json  -> {"updated_at": ..., "resources": [...8 条...]}
   GET /health             -> {"ok": true}
   POST /api/execute       -> {"provider","prompt","model"?} -> {"ok","result"}
-    真下发：调模型接口跑任务。provider 限 openrouter/groq/gemini/sambanova/nex；
+    真下发：调模型接口跑任务。provider 限
+    openrouter/groq/gemini/sambanova/nex/cloudflare；
     prompt 限 4000 字；每分钟最多 10 次（防刷额度）。
 
 只用标准库，不用 pip 装任何东西。python3 server.py 即可跑。
@@ -75,6 +81,8 @@ GROQ_KEY = os.environ.get("GROQ_API_KEY", "")
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 SAMBANOVA_KEY = os.environ.get("SAMBANOVA_API_KEY", "")
 MOSS_KEY = os.environ.get("MOSS_API_KEY", "")
+CLOUDFLARE_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN", "")
+CLOUDFLARE_ACCOUNT_ID = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
 PORT = int(os.environ.get("PORT", "8080"))
 
 _cache = {"at": 0, "data": None}
@@ -404,7 +412,20 @@ def execute_task(provider, prompt, model=None):
         except Exception as e:  # noqa: BLE001
             return None, f"NEX 调用失败: {e}"
         return {"provider": "nex", "model": use_model, "result": text}, None
-    return None, f"不支持的 provider：{provider}（只支持 openrouter/groq/gemini/sambanova/nex）"
+    if provider == "cloudflare":
+        if not CLOUDFLARE_TOKEN:
+            return None, "未配置 CLOUDFLARE_API_TOKEN"
+        if not CLOUDFLARE_ACCOUNT_ID:
+            return None, "未配置 CLOUDFLARE_ACCOUNT_ID（在 Cloudflare 控制台右侧栏复制 Account ID，填进 Cloady 环境变量）"
+        use_model = model or "@cf/meta/llama-3.1-8b-instruct"
+        try:
+            text = _chat_completions(
+                f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/v1",
+                CLOUDFLARE_TOKEN, use_model, prompt)
+        except Exception as e:  # noqa: BLE001
+            return None, f"Cloudflare 调用失败: {e}"
+        return {"provider": "cloudflare", "model": use_model, "result": text}, None
+    return None, f"不支持的 provider：{provider}（只支持 openrouter/groq/gemini/sambanova/nex/cloudflare）"
 
 
 # ---------------- 合并 ----------------
@@ -510,4 +531,6 @@ if __name__ == "__main__":
     print("Gemini key:", "已配置" if GEMINI_KEY else "未配置")
     print("SambaNova key:", "已配置" if SAMBANOVA_KEY else "未配置")
     print("MOSS/NEX key:", "已配置" if MOSS_KEY else "未配置")
+    print("Cloudflare token:", "已配置" if CLOUDFLARE_TOKEN else "未配置")
+    print("Cloudflare account:", "已配置" if CLOUDFLARE_ACCOUNT_ID else "未配置")
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
