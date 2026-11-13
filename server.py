@@ -338,6 +338,22 @@ def _chat_completions(base_url, key, model, prompt):
     return (choices[0].get("message") or {}).get("content") or ""
 
 
+def _cloudflare_run(account_id, token, model, prompt):
+    """Cloudflare Workers AI 原生接口：POST /ai/run/{model}。返回结果文本。"""
+    payload = _post_json(
+        f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{model}",
+        {"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        {"messages": [{"role": "user", "content": prompt}]},
+    )
+    if not payload.get("success", False):
+        errors = payload.get("errors") or []
+        raise ValueError(f"Cloudflare 返回失败：{str(errors)[:200]}")
+    result = payload.get("result") or {}
+    if isinstance(result, dict):
+        return result.get("response") or ""
+    return str(result)
+
+
 def _gemini_generate(model, prompt):
     """Gemini generateContent：只要 API key。返回结果文本。"""
     url = (
@@ -419,9 +435,8 @@ def execute_task(provider, prompt, model=None):
             return None, "未配置 CLOUDFLARE_ACCOUNT_ID（在 Cloudflare 控制台右侧栏复制 Account ID，填进 Cloady 环境变量）"
         use_model = model or "@cf/meta/llama-3.1-8b-instruct"
         try:
-            text = _chat_completions(
-                f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/v1",
-                CLOUDFLARE_TOKEN, use_model, prompt)
+            text = _cloudflare_run(
+                CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_TOKEN, use_model, prompt)
         except Exception as e:  # noqa: BLE001
             return None, f"Cloudflare 调用失败: {e}"
         return {"provider": "cloudflare", "model": use_model, "result": text}, None
