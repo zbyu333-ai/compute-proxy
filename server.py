@@ -44,10 +44,13 @@ Space 里只放 DATA_URL，不放任何密钥。
   验证码即可）。
 - TokenLab（AMD，notebooks.amd.com/tokenlab，2026-11-13 用户注册）：
   OpenAI 兼容，POST https://api.tokenlab.amd.com/v1/chat/completions，
-  默认模型 DeepSeek-V4.1-Flash-1017（1M 上下文）。每个 Key 一次性自带
-  10 Credits，自生成之日起 30 天有效，用完为止，不按天重置；每分钟最多
-  20 次请求。按模型每百万 Tokens 扣点：DeepSeek-V4.1-Flash 输入 0.28、
-  输出 0.56；Qwen3.8-27B、Gemma-4-31B-IT、MiniCPM 输入 0.035、输出 0.07。
+  默认模型 Qwen3.8-27B（2026-11-13 22:22 线上实测通过；DeepSeek-V4.1-Flash
+  同日实测持续 429，疑为免费档饱和/限流，DeepSeek-V4.1-Flash-1017 则
+  404 疑似该名在国际版不存在，两个 DeepSeek 模型名保留可手动指定，
+  通了再换默认）。每个 Key 一次性自带 10 Credits，自生成之日起 30 天
+  有效，用完为止，不按天重置；每分钟最多 20 次请求。按模型每百万 Tokens
+  扣点：DeepSeek-V4.1-Flash 输入 0.28、输出 0.56；Qwen3.8-27B、
+  Gemma-4-31B-IT、MiniCPM 输入 0.035、输出 0.07。
   免费模型另有 DeepSeek-V4-Flash、GLM-5.3、d3、Clef 等（官方完整名单在
   登录墙后，公开页未证实“10 个”的完整清单）。注意与中国站 Radeon Cloud
   Token Factory 区分：那是另一套（15 个模型、每 24 小时滚动额度、接口
@@ -461,7 +464,7 @@ def execute_task(provider, prompt, model=None):
     if provider == "tokenlab":
         if not TOKENLAB_KEY:
             return None, "未配置 TOKENLAB_API_KEY"
-        use_model = model or "DeepSeek-V4.1-Flash-1017"
+        use_model = model or "Qwen3.8-27B"
         try:
             text = _chat_completions(
                 "https://api.tokenlab.amd.com/v1", TOKENLAB_KEY, use_model, prompt)
