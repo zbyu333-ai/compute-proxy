@@ -433,7 +433,7 @@ def execute_task(provider, prompt, model=None):
             return None, "未配置 CLOUDFLARE_API_TOKEN"
         if not CLOUDFLARE_ACCOUNT_ID:
             return None, "未配置 CLOUDFLARE_ACCOUNT_ID（在 Cloudflare 控制台右侧栏复制 Account ID，填进 Cloady 环境变量）"
-        use_model = model or "@cf/meta/llama-3.1-8b-instruct"
+        use_model = model or "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
         try:
             text = _cloudflare_run(
                 CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_TOKEN, use_model, prompt)
