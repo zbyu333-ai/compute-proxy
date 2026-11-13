@@ -378,7 +378,7 @@ def execute_task(provider, prompt, model=None):
     if provider == "gemini":
         if not GEMINI_KEY:
             return None, "未配置 GEMINI_API_KEY"
-        use_model = model or "gemini-2.5-flash"
+        use_model = model or "gemini-3.5-flash-lite"
         try:
             text = _gemini_generate(use_model, prompt)
         except Exception as e:  # noqa: BLE001
