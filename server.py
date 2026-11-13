@@ -358,7 +358,7 @@ def execute_task(provider, prompt, model=None):
     if provider == "openrouter":
         if not OPENROUTER_KEY:
             return None, "未配置 OPENROUTER_API_KEY"
-        use_model = model or "google/gemma-4-31b-it:free"
+        use_model = model or "nvidia/nemotron-3.5-lightning:free"
         try:
             text = _chat_completions(
                 "https://openrouter.ai/api/v1", OPENROUTER_KEY, use_model, prompt)
