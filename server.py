@@ -25,12 +25,15 @@ Space 里只放 DATA_URL，不放任何密钥。
 - Colab / Cloady / Sakupa / Simular：无公开剩余额度接口，读 manual.json 的手工值。
 - Mistral：免费档不给 API key（须付费升级），2026-11-12 用户决定不付费、跳过，
   故不接真下发。
-- NVIDIA NIM：账号已注册，但生成 API key 前须手机验证；2026-11-12 验证时账号
-  被临时封禁 12 小时，2026-11-13 04:00 CST 后才能重试。未接。
-- Cloudflare Workers AI：2026-11-13 用户已在自己浏览器登进 dash.cloudflare.com，
-  正在建 token（自定义权限，“人工智能与机器学习”分组 17 项全选）。已接真下发：
-  OpenAI 兼容端点 POST /client/v4/accounts/{ACCOUNT_ID}/ai/v1/chat/completions，
-  模型 @cf/meta/llama-3.1-8b-instruct。注意光有 token 不够，还要 Account ID
+- NVIDIA NIM：账号已注册，但生成 API key 前须手机验证；用户 2026-11-13 15:10
+  亲自重试又触发 12 小时冻结，下次可重试约 2026-11-14 03:10 CST，勿提前重试。未接。
+- Cloudflare Workers AI：2026-11-13 用户已在自己浏览器登进 dash.cloudflare.com
+  建好 token（自定义权限，“人工智能与机器学习”分组 17 项全选，token 名
+  little-shadow-967f），Cloady 已配 CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID
+  并部署，16:11 默认调用实测 OK。已接真下发：原生端点
+  POST /client/v4/accounts/{ACCOUNT_ID}/ai/run/{model}，默认模型
+  @cf/meta/llama-3.3-70b-instruct-fp8-fast（@cf/meta/llama-3.1-8b-instruct
+  曾报 410，疑为短暂波动）。注意光有 token 不够，还要 Account ID
   （控制台右侧栏复制），否则调不通。
 - NEX（复旦 MOSS，platform.moss.cn）：OpenAI 兼容形态，POST
   https://api.mosi.cn/v1/chat/completions（注意域名是 api.mosi.cn）。
@@ -39,6 +42,19 @@ Space 里只放 DATA_URL，不放任何密钥。
   协议保留随时调价/改额度/下线模型的权利；商用须另行签协议。真下发可用，
   定位为低成本试点/降级通道，不当主力。注册免实名、免绑卡（邮箱或手机号
   验证码即可）。
+- TokenLab（AMD，notebooks.amd.com/tokenlab，2026-11-13 用户注册）：
+  OpenAI 兼容，POST https://api.tokenlab.amd.com/v1/chat/completions，
+  默认模型 DeepSeek-V4.1-Flash-1017（1M 上下文）。每个 Key 一次性自带
+  10 Credits，自生成之日起 30 天有效，用完为止，不按天重置；每分钟最多
+  20 次请求。按模型每百万 Tokens 扣点：DeepSeek-V4.1-Flash 输入 0.28、
+  输出 0.56；Qwen3.8-27B、Gemma-4-31B-IT、MiniCPM 输入 0.035、输出 0.07。
+  免费模型另有 DeepSeek-V4-Flash、GLM-5.3、d3、Clef 等（官方完整名单在
+  登录墙后，公开页未证实“10 个”的完整清单）。注意与中国站 Radeon Cloud
+  Token Factory 区分：那是另一套（15 个模型、每 24 小时滚动额度、接口
+  developer.amd.com.cn/radeon/api/v1、Key 以 rc- 开头），帖子里的“每天
+  重置”说的是中国站，不是 TokenLab。商用限制未核实（AMD 通用条款写
+  仅限个人使用，TokenLab 专属条款在登录后），Beta 状态。真下发可用，
+  定位为备用工位。
 
 环境变量：
   OPENROUTER_API_KEY  OpenRouter 的 API key（sk-or-...）
@@ -49,6 +65,7 @@ Space 里只放 DATA_URL，不放任何密钥。
   MOSS_API_KEY        MOSS/NEX 的 API key（platform.moss.cn 控制台生成）
   CLOUDFLARE_API_TOKEN  Cloudflare API token（Workers AI 权限，dash.cloudflare.com 建）
   CLOUDFLARE_ACCOUNT_ID Cloudflare Account ID（控制台右侧栏复制，token 之外必填）
+  TOKENLAB_API_KEY    AMD TokenLab 的 API key（notebooks.amd.com/tokenlab 生成，tl-...）
   PORT                监听端口，默认 8080
 
 接口：
@@ -56,7 +73,7 @@ Space 里只放 DATA_URL，不放任何密钥。
   GET /health             -> {"ok": true}
   POST /api/execute       -> {"provider","prompt","model"?} -> {"ok","result"}
     真下发：调模型接口跑任务。provider 限
-    openrouter/groq/gemini/sambanova/nex/cloudflare；
+    openrouter/groq/gemini/sambanova/nex/cloudflare/tokenlab；
     prompt 限 4000 字；每分钟最多 10 次（防刷额度）。
 
 只用标准库，不用 pip 装任何东西。python3 server.py 即可跑。
@@ -83,6 +100,7 @@ SAMBANOVA_KEY = os.environ.get("SAMBANOVA_API_KEY", "")
 MOSS_KEY = os.environ.get("MOSS_API_KEY", "")
 CLOUDFLARE_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN", "")
 CLOUDFLARE_ACCOUNT_ID = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
+TOKENLAB_KEY = os.environ.get("TOKENLAB_API_KEY", "")
 PORT = int(os.environ.get("PORT", "8080"))
 
 _cache = {"at": 0, "data": None}
@@ -440,7 +458,17 @@ def execute_task(provider, prompt, model=None):
         except Exception as e:  # noqa: BLE001
             return None, f"Cloudflare 调用失败: {e}"
         return {"provider": "cloudflare", "model": use_model, "result": text}, None
-    return None, f"不支持的 provider：{provider}（只支持 openrouter/groq/gemini/sambanova/nex/cloudflare）"
+    if provider == "tokenlab":
+        if not TOKENLAB_KEY:
+            return None, "未配置 TOKENLAB_API_KEY"
+        use_model = model or "DeepSeek-V4.1-Flash-1017"
+        try:
+            text = _chat_completions(
+                "https://api.tokenlab.amd.com/v1", TOKENLAB_KEY, use_model, prompt)
+        except Exception as e:  # noqa: BLE001
+            return None, f"TokenLab 调用失败: {e}"
+        return {"provider": "tokenlab", "model": use_model, "result": text}, None
+    return None, f"不支持的 provider：{provider}（只支持 openrouter/groq/gemini/sambanova/nex/cloudflare/tokenlab）"
 
 
 # ---------------- 合并 ----------------
@@ -548,4 +576,5 @@ if __name__ == "__main__":
     print("MOSS/NEX key:", "已配置" if MOSS_KEY else "未配置")
     print("Cloudflare token:", "已配置" if CLOUDFLARE_TOKEN else "未配置")
     print("Cloudflare account:", "已配置" if CLOUDFLARE_ACCOUNT_ID else "未配置")
+    print("TokenLab key:", "已配置" if TOKENLAB_KEY else "未配置")
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
