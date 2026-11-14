@@ -87,9 +87,31 @@ Space 里只放 DATA_URL，不放任何密钥。
     真下发：调模型接口跑任务。provider 限
     openrouter/groq/gemini/sambanova/nex/cloudflare/tokenlab/nvidia；
     prompt 限 4000 字；每分钟最多 10 次（防刷额度）。
+  POST /v1/chat/completions -> OpenAI 兼容的真下发（给 ComfyUI 的 LLM 节点用）：
+    {"model": "gemini" 或 "nex" 等 provider 名，也可写 "provider:模型名"，
+     "messages": [{"role": "system"/"user", "content": "..."}]}
+    -> 标准 OpenAI chat.completion 形状。model 也可直接写各家默认模型名
+    （如 gemini-3.5-flash-lite、nex-n2.6、Qwen3.8-27B），会自动认出 provider。
+    不走 OpenAI 的 Responses API，不支持 stream。key 不用填（代理地址本身
+    就是凭证，不要公开扩散）；限流与 /api/execute 共用每分钟 10 次。
+  GET /v1/models          -> {"object": "list", "data": [...]}，列出可当 model 填的 provider 名。
+  POST /v1/images/generations -> OpenAI 兼容的出图（给 ComfyUI 的图片节点用）：
+    {"prompt": "...", "model": "flux-1-schnell"（可空，默认 FLUX），
+     "size": "1024x1024"（可空，FLUX 输出固定 1024x1024，忽略此值），
+     "n": 1（只支持 1），"steps": 4（可空，1-8）}
+    -> 标准 OpenAI 形状 {"created": ..., "data": [{"b64_json": "..."}]}。
+    只支持 response_format=b64_json。model 栏填 gpt-image-* 也会被认成 FLUX
+    （ComfyUI 图片节点的下拉框往往只有 gpt-image，填不进 flux）。
+    出图走 Cloudflare Workers AI 免费档（每天 10,000 Neurons，
+    1024x1024、4 步约 58 Neurons，约 170 张/天；00:00 UTC 重置；用完报错不扣费）。
+    限流与 /api/execute 共用每分钟 10 次。
+  POST /api/image         -> {"prompt", "model"?（可空）, "steps"?（可空，1-8）}
+    -> {"ok": true, "provider": "cloudflare", "model": ..., "image_b64": "..."}。
+    出图失败返回 {"ok": false, "error": ...}。prompt 最多 2048 字。
 
 只用标准库，不用 pip 装任何东西。python3 server.py 即可跑。
 """
+import base64
 import json
 import os
 import re
@@ -494,6 +516,204 @@ def execute_task(provider, prompt, model=None):
     return None, f"不支持的 provider：{provider}（只支持 openrouter/groq/gemini/sambanova/nex/cloudflare/tokenlab/nvidia）"
 
 
+# ---------------- OpenAI 兼容层（给 ComfyUI 的 LLM 节点用） ----------------
+# ComfyUI 的 OpenAI 兼容节点只会发标准 chat/completions，不会发本代理的
+# /api/execute；这里把 chat/completions 翻译成 execute_task 再把结果包回
+# OpenAI 的形状。密钥全程留在代理这边，ComfyUI 那台机器上不用贴任何 key。
+
+_OPENAI_PROVIDERS = (
+    "openrouter", "groq", "gemini", "sambanova",
+    "nex", "cloudflare", "tokenlab", "nvidia",
+)
+
+# 各家默认模型名 -> provider：model 栏直接写模型名时也能认出来。
+_DEFAULT_MODEL_PROVIDER = {
+    "nvidia/nemotron-3.5-lightning:free": "openrouter",
+    "openai/gpt-oss-120b": "groq",
+    "gemini-3.5-flash-lite": "gemini",
+    "meta-llama-3.3-70b-instruct": "sambanova",
+    "nex-n2.6": "nex",
+    "@cf/meta/llama-3.3-70b-instruct-fp8-fast": "cloudflare",
+    "qwen3.8-27b": "tokenlab",
+    "nvidia/llama-3.1-nemotron-70b-instruct": "nvidia",
+}
+
+
+def _resolve_openai_model(model):
+    """把节点 model 栏的值解析成 (provider, model_or_None)。
+
+    接受三种写法：provider 名（gemini）、"provider:模型名"
+    （openrouter:nvidia/nemotron-3.5-lightning:free）、各家默认模型名。
+    """
+    raw = (model or "").strip()
+    if not raw:
+        return "gemini", None
+    if ":" in raw:
+        head, tail = raw.split(":", 1)
+        if head.strip().lower() in _OPENAI_PROVIDERS and tail.strip():
+            return head.strip().lower(), tail.strip()
+    low = raw.lower()
+    if low in _OPENAI_PROVIDERS:
+        return low, None
+    if low in _DEFAULT_MODEL_PROVIDER:
+        return _DEFAULT_MODEL_PROVIDER[low], raw
+    return None, None
+
+
+def _flatten_messages(messages):
+    """把 chat messages 拼成 execute_task 要的单段 prompt。
+
+    content 可能是字符串，也可能是 [{type: text, text: ...}] 列表
+    （个别客户端会这样发；Cloudflare 在 Harness 里就是被这种格式拒掉的，
+    这里先展平成纯文本再往下传）。
+    """
+    lines = []
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        role = (msg.get("role") or "user").strip() or "user"
+        content = msg.get("content")
+        if isinstance(content, list):
+            parts = []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    parts.append(str(part.get("text") or ""))
+                elif isinstance(part, str):
+                    parts.append(part)
+            text = "".join(parts)
+        else:
+            text = str(content or "")
+        text = text.strip()
+        if text:
+            lines.append(f"{role}: {text}" if role != "user" else text)
+    return "\n".join(lines)
+
+
+def _chat_completion_response(model, text):
+    return {
+        "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": text},
+            "finish_reason": "stop",
+        }],
+    }
+
+
+# ---------------- 出图（Cloudflare Workers AI FLUX，免费） ----------------
+# ComfyUI 的图片节点只会发标准 /v1/images/generations，不会发 /api/execute；
+# 这里把 images/generations 翻译成 Cloudflare 原生 /ai/run，再把 base64 图片
+# 包回 OpenAI 的形状。FLUX-1-schnell 是免费档：每天 10,000 Neurons，
+# 1024x1024、4 步约 58 Neurons（约 170 张/天），8 步约 96 Neurons（约 100 张/天），
+# 每天 00:00 UTC 重置；免费档用完后直接报错，不会扣费。
+# 输出尺寸固定 1024x1024（schnell 不接受 width/height），prompt 最多 2048 字。
+
+FLUX_MODEL = "@cf/black-forest-labs/flux-1-schnell"
+IMAGE_MAX_PROMPT = 2048
+IMAGE_STEPS_DEFAULT = 4
+IMAGE_STEPS_MAX = 8
+
+# ComfyUI 图片节点的 model 下拉框里往往只有 gpt-image-*，填不进 flux；
+# 这些名字一律当成“用默认免费模型”，代理实际调 FLUX 出图。
+_IMAGE_MODEL_ALIASES = {
+    "flux-1-schnell": FLUX_MODEL,
+    "flux.1-schnell": FLUX_MODEL,
+    "@cf/black-forest-labs/flux-1-schnell": FLUX_MODEL,
+}
+
+
+def _resolve_image_model(model):
+    """把节点 model 栏的值解析成真正要调的 Cloudflare 图片模型 id。"""
+    raw = (model or "").strip()
+    if not raw:
+        return FLUX_MODEL
+    low = raw.lower()
+    if low in _IMAGE_MODEL_ALIASES:
+        return _IMAGE_MODEL_ALIASES[low]
+    if low.startswith("gpt-image"):
+        return FLUX_MODEL
+    if low.startswith("@cf/"):
+        return raw
+    return FLUX_MODEL
+
+
+def _cloudflare_image(account_id, token, model, prompt, steps):
+    """Cloudflare Workers AI 出图：POST /ai/run/{model}。返回 base64 图片。
+
+    FLUX 返回 JSON {"success": true, "result": {"image": "<base64>"}}；
+    个别模型返回原始图片字节，这里两种都接。
+    """
+    url = (
+        f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{model}"
+    )
+    req = urllib.request.Request(
+        url,
+        data=json.dumps({"prompt": prompt, "steps": steps}).encode(),
+        headers={"Authorization": f"Bearer {token}",
+                 "Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=EXEC_TIMEOUT) as resp:
+        raw = resp.read()
+    # 先按 JSON 解析（FLUX 走这条）
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception:  # noqa: BLE001
+        payload = None
+    if isinstance(payload, dict):
+        if not payload.get("success", True):
+            errors = payload.get("errors") or []
+            raise ValueError(f"Cloudflare 返回失败：{str(errors)[:200]}")
+        result = payload.get("result") or {}
+        if isinstance(result, dict) and result.get("image"):
+            return str(result["image"])
+        if payload.get("image"):
+            return str(payload["image"])
+        raise ValueError(f"Cloudflare 未返回图片：{str(payload)[:200]}")
+    # 不是 JSON：当成原始图片字节
+    if raw[:8] == b"\x89PNG\r\n\x1a\n" or raw[:2] == b"\xff\xd8":
+        return base64.b64encode(raw).decode("ascii")
+    raise ValueError(f"Cloudflare 返回了无法识别的内容：{str(raw[:200])}")
+
+
+def generate_image(prompt, model=None, steps=None):
+    """调 Cloudflare FLUX 出一张图。返回 (result_dict, error_str)。"""
+    prompt = (prompt or "").strip()
+    if not prompt:
+        return None, "prompt 为空"
+    if len(prompt) > IMAGE_MAX_PROMPT:
+        return None, f"prompt 超过 {IMAGE_MAX_PROMPT} 字（Cloudflare 限制）"
+    if not CLOUDFLARE_TOKEN:
+        return None, "未配置 CLOUDFLARE_API_TOKEN"
+    if not CLOUDFLARE_ACCOUNT_ID:
+        return None, "未配置 CLOUDFLARE_ACCOUNT_ID（在 Cloudflare 控制台右侧栏复制 Account ID，填进 Cloady 环境变量）"
+    try:
+        use_steps = int(steps) if steps is not None else IMAGE_STEPS_DEFAULT
+    except (TypeError, ValueError):
+        use_steps = IMAGE_STEPS_DEFAULT
+    use_steps = max(1, min(IMAGE_STEPS_MAX, use_steps))
+    use_model = _resolve_image_model(model)
+    try:
+        b64 = _cloudflare_image(
+            CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_TOKEN, use_model, prompt, use_steps)
+    except Exception as e:  # noqa: BLE001
+        return None, f"Cloudflare 出图失败: {e}"
+    return {
+        "provider": "cloudflare", "model": use_model,
+        "image_b64": b64, "steps": use_steps,
+    }, None
+
+
+def _image_generation_response(model, b64):
+    return {
+        "created": int(time.time()),
+        "data": [{"b64_json": b64}],
+    }
+
+
 # ---------------- 合并 ----------------
 
 def build_resources():
@@ -558,11 +778,24 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"error": str(e)}, status=500)
         elif self.path == "/health":
             self._send_json({"ok": True})
+        elif self.path == "/v1/models":
+            self._send_json({
+                "object": "list",
+                "data": [
+                    {"id": p, "object": "model",
+                     "created": 0, "owned_by": p}
+                    for p in _OPENAI_PROVIDERS
+                ] + [
+                    {"id": "flux-1-schnell", "object": "model",
+                     "created": 0, "owned_by": "cloudflare"},
+                ],
+            })
         else:
             self._send_json({"ok": True, "usage": "GET /api/resources.json"})
 
     def do_POST(self):  # noqa: N802
-        if self.path != "/api/execute":
+        if self.path not in ("/api/execute", "/v1/chat/completions",
+                             "/v1/images/generations", "/api/image"):
             self._send_json({"ok": False, "error": "unknown path"}, status=404)
             return
         try:
@@ -578,8 +811,26 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"ok": False, "error": "请求体不是合法 JSON"}, status=400)
             return
         if not _exec_allowed():
-            self._send_json(
-                {"ok": False, "error": "真下发每分钟最多 10 次，稍后再试"}, status=429)
+            err = "真下发每分钟最多 10 次，稍后再试"
+            if self.path in ("/v1/chat/completions", "/v1/images/generations"):
+                self._send_json(
+                    {"error": {"message": err, "type": "rate_limit"}}, status=429)
+            else:
+                self._send_json({"ok": False, "error": err}, status=429)
+            return
+        if self.path == "/v1/chat/completions":
+            self._handle_openai_chat(body)
+            return
+        if self.path == "/v1/images/generations":
+            self._handle_openai_image(body)
+            return
+        if self.path == "/api/image":
+            result, err = generate_image(
+                body.get("prompt"), body.get("model"), body.get("steps"))
+            if err:
+                self._send_json({"ok": False, "error": err}, status=502)
+                return
+            self._send_json({"ok": True, **result})
             return
         result, err = execute_task(
             body.get("provider"), body.get("prompt"), body.get("model"))
@@ -587,6 +838,67 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"ok": False, "error": err}, status=502)
             return
         self._send_json({"ok": True, **result})
+
+    def _handle_openai_chat(self, body):  # noqa: N802
+        """POST /v1/chat/completions：翻译成 execute_task，包回 OpenAI 形状。"""
+        if body.get("stream"):
+            self._send_json({"error": {
+                "message": "stream 不支持：请在节点里关掉流式输出",
+                "type": "invalid_request"}}, status=400)
+            return
+        messages = body.get("messages")
+        if not isinstance(messages, list) or not messages:
+            self._send_json({"error": {
+                "message": "messages 为空或格式不对",
+                "type": "invalid_request"}}, status=400)
+            return
+        provider, use_model = _resolve_openai_model(body.get("model"))
+        if provider is None:
+            self._send_json({"error": {
+                "message": (
+                    "不支持的 model：请填 provider 名（gemini / nex / "
+                    "tokenlab / openrouter / cloudflare / groq），或写成 "
+                    "\"provider:模型名\"，如 \"openrouter:nvidia/nemotron-3.5-lightning:free\""),
+                "type": "invalid_request"}}, status=400)
+            return
+        prompt = _flatten_messages(messages)
+        result, err = execute_task(provider, prompt, use_model)
+        if err:
+            self._send_json(
+                {"error": {"message": err, "type": "proxy_error"}}, status=502)
+            return
+        self._send_json(_chat_completion_response(
+            body.get("model") or provider, result.get("result") or ""))
+
+    def _handle_openai_image(self, body):  # noqa: N802
+        """POST /v1/images/generations：翻译成 Cloudflare FLUX，包回 OpenAI 形状。"""
+        prompt = (body.get("prompt") or "").strip()
+        if not prompt:
+            self._send_json({"error": {
+                "message": "prompt 为空", "type": "invalid_request"}}, status=400)
+            return
+        if body.get("response_format") not in (None, "b64_json"):
+            self._send_json({"error": {
+                "message": "只支持 response_format=b64_json",
+                "type": "invalid_request"}}, status=400)
+            return
+        try:
+            n = int(body.get("n", 1))
+        except (TypeError, ValueError):
+            n = 1
+        if n != 1:
+            self._send_json({"error": {
+                "message": "一次只能出一张图（n=1）",
+                "type": "invalid_request"}}, status=400)
+            return
+        result, err = generate_image(
+            prompt, body.get("model"), body.get("steps"))
+        if err:
+            self._send_json(
+                {"error": {"message": err, "type": "proxy_error"}}, status=502)
+            return
+        self._send_json(_image_generation_response(
+            result["model"], result["image_b64"]))
 
 
 if __name__ == "__main__":
