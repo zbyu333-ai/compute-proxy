@@ -25,8 +25,16 @@ Space 里只放 DATA_URL，不放任何密钥。
 - Colab / Cloady / Sakupa / Simular：无公开剩余额度接口，读 manual.json 的手工值。
 - Mistral：免费档不给 API key（须付费升级），2026-11-12 用户决定不付费、跳过，
   故不接真下发。
-- NVIDIA NIM：账号已注册，但生成 API key 前须手机验证；用户 2026-11-13 15:10
-  亲自重试又触发 12 小时冻结，下次可重试约 2026-11-14 03:10 CST，勿提前重试。未接。
+- NVIDIA NIM：OpenAI 兼容，POST https://integrate.api.nvidia.com/v1/chat/completions，
+  默认模型 nvidia/llama-3.1-nemotron-70b-instruct（2026-11-14 假 key 实测：该模型
+  返回 403 仅因 key 无效，说明模型在目录里；meta/llama-3.3-70b-instruct 已下线，
+  调它返回 410；nvidia/nemotron-nano-9b-v2、deepseek-ai/deepseek-r1 不在目录，
+  返回 404）。账号 zbyu333，组织 zbyu333-7c0c6f-5bn5，
+  资源限额 $30/小时。2026-11-14 12:00 用户重试登录成功，但 12:08 打开 API 密钥页
+  又触发 12 小时冻结；12:11 进到创建 API 密钥弹窗（compute-proxy、阅读与写作、
+  截止 2027-02-12，90 天有效期），点创建后走 Google 密码管理工具 PIN 验证，
+  随后用户把 key 贴进 Cloady 环境变量 NVIDIA_API_KEY 并重新部署。Key 以 nvapi-
+  开头，只完整显示一次。真下发可用。
 - Cloudflare Workers AI：2026-11-13 用户已在自己浏览器登进 dash.cloudflare.com
   建好 token（自定义权限，“人工智能与机器学习”分组 17 项全选，token 名
   little-shadow-967f），Cloady 已配 CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID
@@ -69,6 +77,7 @@ Space 里只放 DATA_URL，不放任何密钥。
   CLOUDFLARE_API_TOKEN  Cloudflare API token（Workers AI 权限，dash.cloudflare.com 建）
   CLOUDFLARE_ACCOUNT_ID Cloudflare Account ID（控制台右侧栏复制，token 之外必填）
   TOKENLAB_API_KEY    AMD TokenLab 的 API key（notebooks.amd.com/tokenlab 生成，tl-...）
+  NVIDIA_API_KEY      NVIDIA NIM 的 API key（build.nvidia.com/settings/api-keys 生成，nvapi-...）
   PORT                监听端口，默认 8080
 
 接口：
@@ -76,7 +85,7 @@ Space 里只放 DATA_URL，不放任何密钥。
   GET /health             -> {"ok": true}
   POST /api/execute       -> {"provider","prompt","model"?} -> {"ok","result"}
     真下发：调模型接口跑任务。provider 限
-    openrouter/groq/gemini/sambanova/nex/cloudflare/tokenlab；
+    openrouter/groq/gemini/sambanova/nex/cloudflare/tokenlab/nvidia；
     prompt 限 4000 字；每分钟最多 10 次（防刷额度）。
 
 只用标准库，不用 pip 装任何东西。python3 server.py 即可跑。
@@ -104,6 +113,7 @@ MOSS_KEY = os.environ.get("MOSS_API_KEY", "")
 CLOUDFLARE_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN", "")
 CLOUDFLARE_ACCOUNT_ID = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
 TOKENLAB_KEY = os.environ.get("TOKENLAB_API_KEY", "")
+NVIDIA_KEY = os.environ.get("NVIDIA_API_KEY", "")
 PORT = int(os.environ.get("PORT", "8080"))
 
 _cache = {"at": 0, "data": None}
@@ -471,7 +481,17 @@ def execute_task(provider, prompt, model=None):
         except Exception as e:  # noqa: BLE001
             return None, f"TokenLab 调用失败: {e}"
         return {"provider": "tokenlab", "model": use_model, "result": text}, None
-    return None, f"不支持的 provider：{provider}（只支持 openrouter/groq/gemini/sambanova/nex/cloudflare/tokenlab）"
+    if provider == "nvidia":
+        if not NVIDIA_KEY:
+            return None, "未配置 NVIDIA_API_KEY"
+        use_model = model or "nvidia/llama-3.1-nemotron-70b-instruct"
+        try:
+            text = _chat_completions(
+                "https://integrate.api.nvidia.com/v1", NVIDIA_KEY, use_model, prompt)
+        except Exception as e:  # noqa: BLE001
+            return None, f"NVIDIA 调用失败: {e}"
+        return {"provider": "nvidia", "model": use_model, "result": text}, None
+    return None, f"不支持的 provider：{provider}（只支持 openrouter/groq/gemini/sambanova/nex/cloudflare/tokenlab/nvidia）"
 
 
 # ---------------- 合并 ----------------
@@ -580,4 +600,5 @@ if __name__ == "__main__":
     print("Cloudflare token:", "已配置" if CLOUDFLARE_TOKEN else "未配置")
     print("Cloudflare account:", "已配置" if CLOUDFLARE_ACCOUNT_ID else "未配置")
     print("TokenLab key:", "已配置" if TOKENLAB_KEY else "未配置")
+    print("NVIDIA key:", "已配置" if NVIDIA_KEY else "未配置")
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
